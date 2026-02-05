@@ -7,13 +7,13 @@ Outputs a Telegram-friendly text report:
 - Plus: top 10 movers (largest absolute % move) per market from a representative universe.
 
 Data sources (best-effort):
-- Stooq daily CSV for major indices when available
-- yfinance for index levels and constituents (batched, small universes)
+- Stooq daily CSV for major indices
+- Alpha Vantage for US stock movers (free tier: 5 calls/min)
 - local cache as last resort
 
 Usage:
-  python3 scripts/daily_market_prices.py
-  python3 scripts/daily_market_prices.py --date 2026-02-04
+  python3 daily_market_prices.py
+  python3 daily_market_prices.py --date 2026-02-04
 """
 
 from __future__ import annotations
@@ -25,16 +25,9 @@ import os
 import time
 from pathlib import Path
 from typing import Iterable
+from io import StringIO
 
 import pandas as pd
-
-try:
-    import yfinance as yf
-except Exception as e:
-    raise SystemExit(
-        "Missing dependency yfinance. Install with: pip install yfinance pandas\n"
-        f"Import error: {e}"
-    )
 
 try:
     import requests
@@ -43,6 +36,9 @@ except Exception as e:
         "Missing dependency requests. Install with: pip install requests\n"
         f"Import error: {e}"
     )
+
+# Alpha Vantage API Key
+ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "RDOL5OM5RQ6AP8RB")
 
 CACHE_PATH = Path(os.path.expanduser("~/Library/Caches/market-daily-prices/cache.json"))
 CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -70,8 +66,6 @@ def _stooq_last_two_closes(symbol: str, as_of: str | None = None) -> tuple[pd.Ti
     """Fetch last two closes from Stooq daily CSV.
 
     Returns (date, last_close, prev_close). If Stooq is rate-limited, returns None.
-
-    Note: Stooq uses symbols like 'spx', 'ndx', 'hsi' (lowercase), and country suffixes like '.us'.
     """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     try:
@@ -80,7 +74,7 @@ def _stooq_last_two_closes(symbol: str, as_of: str | None = None) -> tuple[pd.Ti
             return None
         if not txt.startswith("Date,"):
             return None
-        df = pd.read_csv(pd.io.common.StringIO(txt))
+        df = pd.read_csv(StringIO(txt))
         if "Date" not in df.columns or "Close" not in df.columns:
             return None
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
@@ -99,65 +93,79 @@ def _stooq_last_two_closes(symbol: str, as_of: str | None = None) -> tuple[pd.Ti
         return None
 
 
-def _yf_last_two_closes(ticker: str, as_of: str | None = None) -> tuple[pd.Timestamp, float, float] | None:
-    """Return (date, last_close, prev_close) for the latest available trading day <= as_of via yfinance."""
-    end = pd.to_datetime(as_of) + pd.Timedelta(days=1) if as_of else None
+def _alphavantage_quote(symbol: str) -> tuple[float, float, float] | None:
+    """Get quote from Alpha Vantage GLOBAL_QUOTE.
 
-    for attempt in range(3):
-        try:
-            df = yf.download(
-                tickers=ticker,
-                period="14d" if end is None else None,
-                start=None if end is None else (end - pd.Timedelta(days=21)).strftime("%Y-%m-%d"),
-                end=None if end is None else end.strftime("%Y-%m-%d"),
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                threads=False,
-                progress=False,
-            )
-            if df is None or df.empty:
-                raise RuntimeError("empty")
+    Returns (price, change, change_percent) or None.
+    """
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
+    try:
+        resp = requests.get(url, timeout=30)
+        data = resp.json()
 
-            df = df.dropna(subset=["Close"], how="any")
-            if len(df) < 2:
-                raise RuntimeError("not enough rows")
+        if "Global Quote" not in data or not data["Global Quote"]:
+            return None
 
-            df.index = pd.to_datetime(df.index)
-            df = df.sort_index()
+        q = data["Global Quote"]
+        price = float(q.get("05. price", 0))
+        change = float(q.get("09. change", 0))
+        change_pct = float(q.get("10. change percent", "0").replace("%", ""))
 
-            last_dt = df.index[-1]
-            last_close = float(df.iloc[-1]["Close"])
-            prev_close = float(df.iloc[-2]["Close"])
-            if prev_close <= 0:
-                raise RuntimeError("bad prev")
-            return last_dt, last_close, prev_close
-        except Exception:
-            time.sleep(1.0 + attempt * 1.5)
-            continue
+        if price <= 0:
+            return None
 
-    return None
+        return price, change, change_pct
+    except Exception:
+        return None
 
 
-def _last_two_closes(ticker: str, *, stooq_symbol: str | None = None, as_of: str | None = None) -> tuple[pd.Timestamp, float, float] | None:
-    """Try Stooq first (if symbol provided), then yfinance, then cache."""
-    # 1) stooq
+def _alphavantage_daily(symbol: str) -> tuple[pd.Timestamp, float, float] | None:
+    """Get last two closes from Alpha Vantage TIME_SERIES_DAILY.
+
+    Returns (date, last_close, prev_close) or None.
+    """
+    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}&outputsize=compact"
+    try:
+        resp = requests.get(url, timeout=30)
+        data = resp.json()
+
+        if "Time Series (Daily)" not in data:
+            return None
+
+        ts = data["Time Series (Daily)"]
+        dates = sorted(ts.keys(), reverse=True)
+
+        if len(dates) < 2:
+            return None
+
+        last_date = dates[0]
+        prev_date = dates[1]
+
+        last_close = float(ts[last_date]["4. close"])
+        prev_close = float(ts[prev_date]["4. close"])
+
+        if prev_close <= 0:
+            return None
+
+        return pd.Timestamp(last_date), last_close, prev_close
+    except Exception:
+        return None
+
+
+def _last_two_closes_index(ticker: str, stooq_symbol: str | None = None, as_of: str | None = None) -> tuple[pd.Timestamp, float, float] | None:
+    """Try Stooq first for indices, then cache."""
+    # 1) stooq (best for indices)
     if stooq_symbol:
         r = _stooq_last_two_closes(stooq_symbol, as_of=as_of)
         if r is not None:
             return r
 
-    # 2) yfinance
-    r = _yf_last_two_closes(ticker, as_of=as_of)
-    if r is not None:
-        return r
-
-    # 3) cache
+    # 2) cache
     cache = _load_cache()
     if ticker in cache:
         try:
             d = pd.to_datetime(cache[ticker]["date"])
-            return pd.Timestamp(d), float(cache[ticker]["close"]), float(cache[ticker]["prev"])  # type: ignore
+            return pd.Timestamp(d), float(cache[ticker]["close"]), float(cache[ticker]["prev"])
         except Exception:
             return None
 
@@ -178,18 +186,33 @@ def _fmt_row(name: str, close: float | None, chg: float | None, pct: float | Non
     return f"{name:<18} | {close_s:>12} | {chg_s:>10} | {pct_s:>9}"
 
 
-def _movers_table(title: str, movers: list[tuple[str, str, float]] | None) -> str:
+def _movers_table(title: str, movers: list[tuple[str, str, float]] | None, limit: int = 10) -> str:
     """movers: list of (ticker, name, pct)."""
     if not movers:
         return f"{title}\n- (조회 실패/데이터 없음)"
 
     lines = ["ticker      | name                           | move%", "-" * 62]
-    for t, n, p in movers[:10]:
+    for t, n, p in movers[:limit]:
         n2 = (n or "").strip().replace("\n", " ")
         if len(n2) > 30:
             n2 = n2[:27] + "..."
         lines.append(f"{t:<10} | {n2:<30} | {p:+.2f}%")
     return f"{title}\n```\n" + "\n".join(lines) + "\n```"
+
+
+def _format_gainers_losers(gainers: list[tuple[str, str, float]], losers: list[tuple[str, str, float]], market: str) -> str:
+    """Format gainers and losers into two tables."""
+    parts = []
+
+    # Gainers (sorted by pct descending)
+    gainers_sorted = sorted(gainers, key=lambda x: x[2], reverse=True)[:10]
+    parts.append(_movers_table(f"📈 {market} 상승 Top 10", gainers_sorted))
+
+    # Losers (sorted by pct ascending)
+    losers_sorted = sorted(losers, key=lambda x: x[2])[:10]
+    parts.append(_movers_table(f"📉 {market} 하락 Top 10", losers_sorted))
+
+    return "\n\n".join(parts)
 
 
 def _section(title: str, rows: list[str]) -> str:
@@ -203,7 +226,6 @@ def _read_constituents_csv(path: Path) -> pd.DataFrame | None:
     if not path.exists():
         return None
     df = pd.read_csv(path)
-    # Expect: ticker,name,(optional)sector
     if "ticker" not in df.columns:
         return None
     if "name" not in df.columns:
@@ -216,7 +238,7 @@ def _read_constituents_csv(path: Path) -> pd.DataFrame | None:
 
 def _wiki_table_first(url: str) -> pd.DataFrame:
     html = requests.get(url, headers=UA, timeout=30).text
-    tables = pd.read_html(html)
+    tables = pd.read_html(StringIO(html))
 
     target = None
     tcol = None
@@ -232,7 +254,6 @@ def _wiki_table_first(url: str) -> pd.DataFrame:
     if target is None or tcol is None:
         raise RuntimeError(f"Ticker table not found: {url}")
 
-    # pick a name-ish column
     ncol = None
     for c in target.columns:
         lc = str(c).lower()
@@ -249,7 +270,6 @@ def _wiki_table_first(url: str) -> pd.DataFrame:
 
 
 def _get_universe_us_ndx() -> pd.DataFrame:
-    # Prefer blog repo pinned list if you later add it; fallback to Wikipedia.
     df = _read_constituents_csv(BLOG_CONSTITUENTS / "us_ndx.csv")
     if df is not None:
         return df
@@ -261,7 +281,6 @@ def _get_universe_cn_csi300() -> pd.DataFrame:
     df = _read_constituents_csv(BLOG_CONSTITUENTS / "cn_csi300.csv")
     if df is not None:
         return df
-    # Fallback: small representative list (avoids huge scrape).
     return pd.DataFrame({
         "ticker": ["600519.SS", "601398.SS", "600036.SS", "600276.SS", "300750.SZ", "000333.SZ", "000858.SZ", "601318.SS", "600887.SS", "601888.SS"],
         "name": ["Kweichow Moutai", "ICBC", "CMB", "Hengrui", "CATL", "Midea", "Wuliangye", "Ping An", "Ili", "China Tourism"],
@@ -272,7 +291,6 @@ def _get_universe_hk_hsi() -> pd.DataFrame:
     df = _read_constituents_csv(BLOG_CONSTITUENTS / "hk_hsi.csv")
     if df is not None:
         return df
-    # Wikipedia sometimes contains SEHK:xxxx. Normalize to 4-digit .HK
     df = _wiki_table_first("https://en.wikipedia.org/wiki/Hang_Seng_Index")
     dig = df["ticker"].str.extract(r"(\d+)", expand=False).fillna("")
     df["ticker"] = dig.apply(lambda x: x.zfill(4) if x else x)
@@ -281,95 +299,62 @@ def _get_universe_hk_hsi() -> pd.DataFrame:
     return df.head(60)
 
 
-def _pct_changes_for_universe(df: pd.DataFrame, as_of: str | None) -> pd.DataFrame:
-    """Return df with pct column for last available day <= as_of.
+def _get_movers_alphavantage(df: pd.DataFrame, market: str) -> tuple[list[tuple[str, str, float]], list[tuple[str, str, float]]]:
+    """Get top movers using Alpha Vantage.
 
-    Uses yfinance in batches; if rate-limited, returns empty.
+    Due to rate limit (5/min), only fetch top 25 tickers.
+    Returns (gainers, losers) tuple.
     """
-    tickers = df["ticker"].astype(str).tolist()
+    tickers = df["ticker"].astype(str).tolist()[:25]  # Limit due to rate limit
+    ticker_to_name = dict(zip(df["ticker"], df["name"]))
 
-    # de-dup
-    seen = set()
-    tickers = [t for t in tickers if not (t in seen or seen.add(t))]
+    gainers = []
+    losers = []
 
-    end = pd.to_datetime(as_of) + pd.Timedelta(days=1) if as_of else None
-    start = (end - pd.Timedelta(days=21)) if end is not None else None
+    for i, ticker in enumerate(tickers):
+        # Alpha Vantage uses plain symbols for US stocks
+        av_symbol = ticker.replace("-", ".")
 
-    out = []
-    batch_size = 40
+        quote = _alphavantage_quote(av_symbol)
+        if quote:
+            price, change, change_pct = quote
+            item = (ticker, ticker_to_name.get(ticker, ticker), change_pct)
+            if change_pct >= 0:
+                gainers.append(item)
+            else:
+                losers.append(item)
 
-    for i0 in range(0, len(tickers), batch_size):
-        batch = tickers[i0 : i0 + batch_size]
-        try:
-            data = yf.download(
-                tickers=batch,
-                start=None if start is None else start.strftime("%Y-%m-%d"),
-                end=None if end is None else end.strftime("%Y-%m-%d"),
-                period="14d" if end is None else None,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                threads=False,
-                progress=False,
-            )
-        except Exception:
-            return pd.DataFrame()
+        # Rate limit: 5 calls per minute = 12 seconds between calls
+        # But we'll use 13 seconds to be safe
+        if i < len(tickers) - 1:
+            print(f"  [{market}] Fetched {ticker}, waiting... ({i+1}/{len(tickers)})")
+            time.sleep(13)
 
-        for t in batch:
-            try:
-                if isinstance(data.columns, pd.MultiIndex):
-                    if (t, "Close") not in data.columns:
-                        continue
-                    s = data[(t, "Close")].dropna()
-                else:
-                    s = data["Close"].dropna()
-
-                if len(s) < 2:
-                    continue
-
-                s.index = pd.to_datetime(s.index)
-                # pick last day
-                last = float(s.iloc[-1])
-                prev = float(s.iloc[-2])
-                if prev <= 0:
-                    continue
-                pct = (last / prev - 1.0) * 100.0
-                out.append((t, pct))
-            except Exception:
-                continue
-
-        time.sleep(0.8)
-
-    if not out:
-        return pd.DataFrame()
-
-    pct_df = pd.DataFrame(out, columns=["ticker", "pct"]).drop_duplicates("ticker")
-    merged = df.merge(pct_df, on="ticker", how="left")
-    return merged
+    return gainers, losers
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="YYYY-MM-DD (optional). If omitted, uses latest available.")
+    ap.add_argument("--skip-movers", action="store_true", help="Skip fetching movers (faster)")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
     as_of = args.date
 
-    # Tickers: keep it small.
-    # Map includes optional Stooq symbol for fallback.
+    # Index definitions with Stooq symbols
     us = {
-        "S&P 500": {"yf": "^GSPC", "stooq": "spx"},
-        "NASDAQ 100": {"yf": "^NDX", "stooq": "ndx"},
+        "S&P 500": {"ticker": "^GSPC", "stooq": "^spx"},
+        "NASDAQ 100": {"ticker": "^NDX", "stooq": "^ndx"},
     }
     cn = {
-        "SSE": {"yf": "000001.SS", "stooq": None},
-        "CSI 300": {"yf": "000300.SS", "stooq": None},
+        "SSE": {"ticker": "000001.SS", "stooq": "000001.ss"},
+        "CSI 300": {"ticker": "000300.SS", "stooq": None},
     }
     hk = {
-        "Hang Seng": {"yf": "^HSI", "stooq": "hsi"},
+        "Hang Seng": {"ticker": "^HSI", "stooq": "^hsi"},
     }
 
-    # Movers universes (kept moderate for rate-limit resilience)
+    # Movers universes
     uni_us = _get_universe_us_ndx()
     uni_cn = _get_universe_cn_csi300()
     uni_hk = _get_universe_hk_hsi()
@@ -380,16 +365,17 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     cache = _load_cache()
 
+    print("Fetching index data from Stooq...")
     for title, mp in [("🇺🇸 미국 (전일 종가 기준)", us), ("🇨🇳 중국 (직전 거래일 종가 기준)", cn), ("🇭🇰 홍콩 (직전 거래일 종가 기준)", hk)]:
         rows = []
         for name, spec in mp.items():
-            yf_tkr = spec["yf"]
+            ticker = spec["ticker"]
             stooq_sym = spec.get("stooq")
 
-            r = _last_two_closes(yf_tkr, stooq_symbol=stooq_sym, as_of=as_of)
+            r = _last_two_closes_index(ticker, stooq_symbol=stooq_sym, as_of=as_of)
             if r is None:
                 rows.append(_fmt_row(name, None, None, None))
-                failures.append(yf_tkr)
+                failures.append(ticker)
                 continue
 
             d, close, prev = r
@@ -397,30 +383,28 @@ def main(argv: Iterable[str] | None = None) -> int:
             pct = (close / prev - 1.0) * 100.0
             rows.append(_fmt_row(name, close, chg, pct))
 
-            # update cache
-            cache[yf_tkr] = {"date": d.strftime("%Y-%m-%d"), "close": close, "prev": prev}
+            cache[ticker] = {"date": d.strftime("%Y-%m-%d"), "close": close, "prev": prev}
 
             if report_date is None:
                 report_date = d.date()
 
         sections.append(_section(title, rows))
 
-    # Movers
+    # Movers (using Alpha Vantage for US only due to rate limits)
     movers_blocks = []
-    def top10(df_uni: pd.DataFrame, label: str) -> list[tuple[str, str, float]]:
-        dfp = _pct_changes_for_universe(df_uni, as_of=as_of)
-        if dfp.empty or "pct" not in dfp.columns:
-            return []
-        dfp = dfp.dropna(subset=["pct"]).copy()
-        if dfp.empty:
-            return []
-        dfp["abs"] = dfp["pct"].abs()
-        dfp = dfp.sort_values("abs", ascending=False).head(10)
-        return [(r["ticker"], r.get("name", r["ticker"]), float(r["pct"])) for _, r in dfp.iterrows()]
 
-    movers_blocks.append(_movers_table("🇺🇸 미국 Top movers (NDX universe, |move%| Top 10)", top10(uni_us, "US")))
-    movers_blocks.append(_movers_table("🇨🇳 중국 Top movers (CSI300 universe, |move%| Top 10)", top10(uni_cn, "CN")))
-    movers_blocks.append(_movers_table("🇭🇰 홍콩 Top movers (HSI universe, |move%| Top 10)", top10(uni_hk, "HK")))
+    if args.skip_movers:
+        movers_blocks.append("🇺🇸 미국 상승/하락 Top 10\n- (--skip-movers 옵션으로 스킵)")
+        movers_blocks.append("🇨🇳 중국 상승/하락 Top 10\n- (--skip-movers 옵션으로 스킵)")
+        movers_blocks.append("🇭🇰 홍콩 상승/하락 Top 10\n- (--skip-movers 옵션으로 스킵)")
+    else:
+        print("\nFetching US movers from Alpha Vantage (this takes ~5 minutes due to rate limit)...")
+        us_gainers, us_losers = _get_movers_alphavantage(uni_us, "US")
+        movers_blocks.append(_format_gainers_losers(us_gainers, us_losers, "🇺🇸 미국 (NDX)"))
+
+        # For CN and HK, Alpha Vantage doesn't support well, so skip or use placeholder
+        movers_blocks.append("🇨🇳 중국 상승/하락 Top 10\n- (Alpha Vantage 미지원)")
+        movers_blocks.append("🇭🇰 홍콩 상승/하락 Top 10\n- (Alpha Vantage 미지원)")
 
     _save_cache(cache)
 
@@ -428,8 +412,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     comments = [
         "코멘트:",
-        "- 히트맵/종목 단위는 오늘은 스킵(무료 소스 제한 때문에 안정성 우선)",
-        "- 지수 데이터가 '조회 실패'로 나오면, 보통 무료 엔드포인트(야후) 일시 제한/네트워크 이슈",
+        "- 지수: Stooq 무료 API 사용",
+        "- US Movers: Alpha Vantage 무료 API (분당 5회 제한)",
+        "- CN/HK Movers: Alpha Vantage 미지원으로 스킵",
     ]
     if failures:
         comments.append(f"- 실패 티커: {', '.join(failures)}")
@@ -441,6 +426,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         *movers_blocks,
         "\n".join(comments),
     ])
+    print("\n" + "="*60 + "\n")
     print(out)
     return 0
 
