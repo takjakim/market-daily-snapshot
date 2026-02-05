@@ -68,6 +68,7 @@ def _stooq_last_two_closes(symbol: str, as_of: str | None = None) -> tuple[pd.Ti
     Returns (date, last_close, prev_close). If Stooq is rate-limited, returns None.
     """
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
+    time.sleep(2)  # delay to avoid rate limit
     try:
         txt = requests.get(url, headers=UA, timeout=30).text.strip()
         if not txt or txt.startswith("Exceeded the daily hits limit"):
@@ -153,15 +154,28 @@ def _alphavantage_daily(symbol: str) -> tuple[pd.Timestamp, float, float] | None
 
 
 def _last_two_closes_index(ticker: str, stooq_symbol: str | None = None, as_of: str | None = None) -> tuple[pd.Timestamp, float, float] | None:
-    """Try Stooq first for indices, then cache."""
-    # 1) stooq (best for indices)
+    """Try cache first (if recent), then Stooq for indices."""
+    today = dt.date.today()
+
+    # 1) cache first - use if data is from today or yesterday (still fresh)
+    cache = _load_cache()
+    if ticker in cache:
+        try:
+            cached_date = pd.to_datetime(cache[ticker]["date"]).date()
+            # Use cache if it's recent (within 2 days)
+            if (today - cached_date).days <= 2:
+                d = pd.to_datetime(cache[ticker]["date"])
+                return pd.Timestamp(d), float(cache[ticker]["close"]), float(cache[ticker]["prev"])
+        except Exception:
+            pass
+
+    # 2) stooq (if cache miss or stale)
     if stooq_symbol:
         r = _stooq_last_two_closes(stooq_symbol, as_of=as_of)
         if r is not None:
             return r
 
-    # 2) cache
-    cache = _load_cache()
+    # 3) fallback to any cached data
     if ticker in cache:
         try:
             d = pd.to_datetime(cache[ticker]["date"])
