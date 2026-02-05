@@ -6,14 +6,17 @@ Outputs a Telegram-friendly text report:
 - Each section has a monospace table: [index | close | change | change%]
 - Plus: top 10 movers (largest absolute % move) per market from a representative universe.
 
-Data sources (best-effort):
-- Stooq daily CSV for major indices
-- Alpha Vantage for US stock movers (free tier: 5 calls/min)
-- local cache as last resort
+Data sources (multi-source fallback):
+1. Cache (if recent, within 2 days)
+2. Stooq daily CSV
+3. Alpha Vantage (via ETF proxies: SPY, QQQ, EWH)
+4. yfinance
+5. Cache (stale data as last resort)
 
 Usage:
   python3 daily_market_prices.py
   python3 daily_market_prices.py --date 2026-02-04
+  python3 daily_market_prices.py --skip-movers --markdown daily/2026-02-06.md
 """
 
 from __future__ import annotations
@@ -31,18 +34,31 @@ import pandas as pd
 
 try:
     import requests
-except Exception as e:
-    raise SystemExit(
-        "Missing dependency requests. Install with: pip install requests\n"
-        f"Import error: {e}"
-    )
+except ImportError:
+    raise SystemExit("Missing requests. Install: pip install requests")
+
+# Optional: yfinance for fallback
+try:
+    import yfinance as yf
+    HAS_YFINANCE = True
+except ImportError:
+    HAS_YFINANCE = False
 
 # Alpha Vantage API Key
 ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "RDOL5OM5RQ6AP8RB")
 
 CACHE_PATH = Path(os.path.expanduser("~/Library/Caches/market-daily-prices/cache.json"))
 CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X)"}
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+
+# ETF proxies for indices (used with Alpha Vantage)
+ETF_PROXIES = {
+    "^GSPC": "SPY",      # S&P 500 → SPDR S&P 500 ETF
+    "^NDX": "QQQ",       # NASDAQ 100 → Invesco QQQ
+    "^HSI": "EWH",       # Hang Seng → iShares MSCI Hong Kong ETF
+    "000001.SS": None,   # SSE - no good ETF proxy
+    "000300.SS": None,   # CSI 300 - no good ETF proxy
+}
 
 # Optional: reuse constituent CSVs from the blog repo if present.
 BLOG_REPO = Path(os.path.expanduser("~/clawd/work/takjakim.github.io"))
@@ -63,17 +79,16 @@ def _save_cache(cache: dict) -> None:
 
 
 def _stooq_last_two_closes(symbol: str, as_of: str | None = None) -> tuple[pd.Timestamp, float, float] | None:
-    """Fetch last two closes from Stooq daily CSV.
-
-    Returns (date, last_close, prev_close). If Stooq is rate-limited, returns None.
-    """
+    """Fetch last two closes from Stooq daily CSV."""
     url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
     time.sleep(2)  # delay to avoid rate limit
     try:
         txt = requests.get(url, headers=UA, timeout=30).text.strip()
-        if not txt or txt.startswith("Exceeded the daily hits limit"):
+        if not txt or txt.startswith("Exceeded"):
+            print(f"    [Stooq] {symbol}: rate limited")
             return None
         if not txt.startswith("Date,"):
+            print(f"    [Stooq] {symbol}: invalid response")
             return None
         df = pd.read_csv(StringIO(txt))
         if "Date" not in df.columns or "Close" not in df.columns:
@@ -89,16 +104,152 @@ def _stooq_last_two_closes(symbol: str, as_of: str | None = None) -> tuple[pd.Ti
                 return None
         last = df.iloc[-1]
         prev = df.iloc[-2]
+        print(f"    [Stooq] {symbol}: OK")
         return pd.Timestamp(last["Date"]), float(last["Close"]), float(prev["Close"])
-    except Exception:
+    except Exception as e:
+        print(f"    [Stooq] {symbol}: error - {e}")
         return None
 
 
-def _alphavantage_quote(symbol: str) -> tuple[float, float, float] | None:
-    """Get quote from Alpha Vantage GLOBAL_QUOTE.
+def _alphavantage_daily(symbol: str) -> tuple[pd.Timestamp, float, float] | None:
+    """Get last two closes from Alpha Vantage TIME_SERIES_DAILY."""
+    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}&outputsize=compact"
+    time.sleep(12)  # Alpha Vantage free tier: 5 calls/min
+    try:
+        resp = requests.get(url, timeout=30)
+        data = resp.json()
 
-    Returns (price, change, change_percent) or None.
+        if "Time Series (Daily)" not in data:
+            print(f"    [AlphaVantage] {symbol}: no data")
+            return None
+
+        ts = data["Time Series (Daily)"]
+        dates = sorted(ts.keys(), reverse=True)
+
+        if len(dates) < 2:
+            return None
+
+        last_date = dates[0]
+        prev_date = dates[1]
+
+        last_close = float(ts[last_date]["4. close"])
+        prev_close = float(ts[prev_date]["4. close"])
+
+        if prev_close <= 0:
+            return None
+
+        print(f"    [AlphaVantage] {symbol}: OK")
+        return pd.Timestamp(last_date), last_close, prev_close
+    except Exception as e:
+        print(f"    [AlphaVantage] {symbol}: error - {e}")
+        return None
+
+
+def _yfinance_last_two_closes(ticker: str, as_of: str | None = None) -> tuple[pd.Timestamp, float, float] | None:
+    """Get last two closes from yfinance."""
+    if not HAS_YFINANCE:
+        return None
+
+    time.sleep(1)
+    try:
+        end = pd.to_datetime(as_of) + pd.Timedelta(days=1) if as_of else None
+        df = yf.download(
+            tickers=ticker,
+            period="14d" if end is None else None,
+            start=None if end is None else (end - pd.Timedelta(days=21)).strftime("%Y-%m-%d"),
+            end=None if end is None else end.strftime("%Y-%m-%d"),
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+        )
+        if df is None or df.empty or len(df) < 2:
+            print(f"    [yfinance] {ticker}: no data")
+            return None
+
+        df = df.dropna(subset=["Close"])
+        if len(df) < 2:
+            return None
+
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+
+        last_dt = df.index[-1]
+        last_close = float(df.iloc[-1]["Close"])
+        prev_close = float(df.iloc[-2]["Close"])
+
+        if prev_close <= 0:
+            return None
+
+        print(f"    [yfinance] {ticker}: OK")
+        return last_dt, last_close, prev_close
+    except Exception as e:
+        print(f"    [yfinance] {ticker}: error - {e}")
+        return None
+
+
+def _last_two_closes_index(
+    ticker: str,
+    stooq_symbol: str | None = None,
+    as_of: str | None = None
+) -> tuple[pd.Timestamp, float, float, str] | None:
     """
+    Multi-source fallback for index data.
+    Returns (date, last_close, prev_close, source) or None.
+
+    Fallback order:
+    1. Cache (if recent, within 2 days)
+    2. Stooq
+    3. Alpha Vantage (via ETF proxy)
+    4. yfinance
+    5. Cache (stale data)
+    """
+    today = dt.date.today()
+    cache = _load_cache()
+
+    # 1) Cache first - use if recent (within 2 days)
+    if ticker in cache:
+        try:
+            cached_date = pd.to_datetime(cache[ticker]["date"]).date()
+            if (today - cached_date).days <= 2:
+                d = pd.to_datetime(cache[ticker]["date"])
+                print(f"    [Cache] {ticker}: using recent cache ({cached_date})")
+                return pd.Timestamp(d), float(cache[ticker]["close"]), float(cache[ticker]["prev"]), "cache"
+        except Exception:
+            pass
+
+    # 2) Stooq
+    if stooq_symbol:
+        r = _stooq_last_two_closes(stooq_symbol, as_of=as_of)
+        if r is not None:
+            return (*r, "stooq")
+
+    # 3) Alpha Vantage (via ETF proxy)
+    etf = ETF_PROXIES.get(ticker)
+    if etf:
+        r = _alphavantage_daily(etf)
+        if r is not None:
+            return (*r, f"alphavantage({etf})")
+
+    # 4) yfinance
+    if HAS_YFINANCE:
+        r = _yfinance_last_two_closes(ticker, as_of=as_of)
+        if r is not None:
+            return (*r, "yfinance")
+
+    # 5) Fallback to any cached data (even if stale)
+    if ticker in cache:
+        try:
+            d = pd.to_datetime(cache[ticker]["date"])
+            print(f"    [Cache] {ticker}: using stale cache")
+            return pd.Timestamp(d), float(cache[ticker]["close"]), float(cache[ticker]["prev"]), "cache(stale)"
+        except Exception:
+            pass
+
+    return None
+
+
+def _alphavantage_quote(symbol: str) -> tuple[float, float, float] | None:
+    """Get quote from Alpha Vantage GLOBAL_QUOTE for movers."""
     url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}"
     try:
         resp = requests.get(url, timeout=30)
@@ -120,73 +271,7 @@ def _alphavantage_quote(symbol: str) -> tuple[float, float, float] | None:
         return None
 
 
-def _alphavantage_daily(symbol: str) -> tuple[pd.Timestamp, float, float] | None:
-    """Get last two closes from Alpha Vantage TIME_SERIES_DAILY.
-
-    Returns (date, last_close, prev_close) or None.
-    """
-    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={ALPHA_VANTAGE_API_KEY}&outputsize=compact"
-    try:
-        resp = requests.get(url, timeout=30)
-        data = resp.json()
-
-        if "Time Series (Daily)" not in data:
-            return None
-
-        ts = data["Time Series (Daily)"]
-        dates = sorted(ts.keys(), reverse=True)
-
-        if len(dates) < 2:
-            return None
-
-        last_date = dates[0]
-        prev_date = dates[1]
-
-        last_close = float(ts[last_date]["4. close"])
-        prev_close = float(ts[prev_date]["4. close"])
-
-        if prev_close <= 0:
-            return None
-
-        return pd.Timestamp(last_date), last_close, prev_close
-    except Exception:
-        return None
-
-
-def _last_two_closes_index(ticker: str, stooq_symbol: str | None = None, as_of: str | None = None) -> tuple[pd.Timestamp, float, float] | None:
-    """Try cache first (if recent), then Stooq for indices."""
-    today = dt.date.today()
-
-    # 1) cache first - use if data is from today or yesterday (still fresh)
-    cache = _load_cache()
-    if ticker in cache:
-        try:
-            cached_date = pd.to_datetime(cache[ticker]["date"]).date()
-            # Use cache if it's recent (within 2 days)
-            if (today - cached_date).days <= 2:
-                d = pd.to_datetime(cache[ticker]["date"])
-                return pd.Timestamp(d), float(cache[ticker]["close"]), float(cache[ticker]["prev"])
-        except Exception:
-            pass
-
-    # 2) stooq (if cache miss or stale)
-    if stooq_symbol:
-        r = _stooq_last_two_closes(stooq_symbol, as_of=as_of)
-        if r is not None:
-            return r
-
-    # 3) fallback to any cached data
-    if ticker in cache:
-        try:
-            d = pd.to_datetime(cache[ticker]["date"])
-            return pd.Timestamp(d), float(cache[ticker]["close"]), float(cache[ticker]["prev"])
-        except Exception:
-            return None
-
-    return None
-
-
-def _fmt_row(name: str, close: float | None, chg: float | None, pct: float | None) -> str:
+def _fmt_row(name: str, close: float | None, chg: float | None, pct: float | None, source: str = "") -> str:
     def fnum(x: float | None) -> str:
         return "조회 실패" if x is None else f"{x:,.2f}"
 
@@ -218,11 +303,9 @@ def _format_gainers_losers(gainers: list[tuple[str, str, float]], losers: list[t
     """Format gainers and losers into two tables."""
     parts = []
 
-    # Gainers (sorted by pct descending)
     gainers_sorted = sorted(gainers, key=lambda x: x[2], reverse=True)[:10]
     parts.append(_movers_table(f"📈 {market} 상승 Top 10", gainers_sorted))
 
-    # Losers (sorted by pct ascending)
     losers_sorted = sorted(losers, key=lambda x: x[2])[:10]
     parts.append(_movers_table(f"📉 {market} 하락 Top 10", losers_sorted))
 
@@ -234,6 +317,82 @@ def _section(title: str, rows: list[str]) -> str:
     sep = "-" * len(header)
     body = "\n".join([header, sep, *rows])
     return f"{title}\n```\n{body}\n```"
+
+
+def _format_markdown(
+    report_date: str,
+    indices: dict[str, dict],
+    gainers: list[tuple[str, str, float]],
+    losers: list[tuple[str, str, float]]
+) -> str:
+    """Obsidian/GitHub wiki 호환 마크다운 포맷 (백링크 지원)"""
+    today = report_date or dt.date.today().isoformat()
+    yesterday = (dt.datetime.fromisoformat(today) - dt.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    lines = [
+        "---",
+        f"date: {today}",
+        "type: market-snapshot",
+        "tags: [market, daily, indices]",
+        "---",
+        "",
+        f"# Daily Market Snapshot - {today}",
+        "",
+    ]
+
+    # US Indices
+    lines.append("## 🇺🇸 US Indices")
+    lines.append("")
+    lines.append("| Index | Close | Change | % | Source |")
+    lines.append("|-------|------:|-------:|--:|--------|")
+    for name, data in indices.get("US", {}).items():
+        if data.get("close"):
+            src = data.get("source", "")
+            lines.append(f"| [[{name}]] | {data['close']:,.2f} | {data['change']:+,.2f} | {data['pct']:+.2f}% | {src} |")
+        else:
+            lines.append(f"| [[{name}]] | - | - | - | - |")
+    lines.append("")
+
+    # HK Index
+    lines.append("## 🇭🇰 Hong Kong")
+    lines.append("")
+    lines.append("| Index | Close | Change | % | Source |")
+    lines.append("|-------|------:|-------:|--:|--------|")
+    for name, data in indices.get("HK", {}).items():
+        if data.get("close"):
+            src = data.get("source", "")
+            lines.append(f"| [[{name}]] | {data['close']:,.2f} | {data['change']:+,.2f} | {data['pct']:+.2f}% | {src} |")
+        else:
+            lines.append(f"| [[{name}]] | - | - | - | - |")
+    lines.append("")
+
+    # Top Gainers
+    if gainers:
+        lines.append("## 📈 Top Gainers")
+        lines.append("")
+        for ticker, name, pct in gainers[:10]:
+            ticker_clean = ticker.replace("-", "")
+            lines.append(f"- [[{ticker_clean}]] **{pct:+.2f}%** - {name}")
+        lines.append("")
+
+    # Top Losers
+    if losers:
+        lines.append("## 📉 Top Losers")
+        lines.append("")
+        for ticker, name, pct in losers[:10]:
+            ticker_clean = ticker.replace("-", "")
+            lines.append(f"- [[{ticker_clean}]] **{pct:+.2f}%** - {name}")
+        lines.append("")
+
+    # Related
+    lines.append("---")
+    lines.append("")
+    lines.append("## Related")
+    lines.append("")
+    lines.append(f"- [[Daily Market Snapshot - {yesterday}|어제 시황]]")
+    lines.append(f"- [[Global News - {today}|오늘 뉴스]]")
+
+    return "\n".join(lines)
 
 
 def _read_constituents_csv(path: Path) -> pd.DataFrame | None:
@@ -313,97 +472,15 @@ def _get_universe_hk_hsi() -> pd.DataFrame:
     return df.head(60)
 
 
-def _format_markdown(
-    report_date: str,
-    indices: dict[str, dict],
-    gainers: list[tuple[str, str, float]],
-    losers: list[tuple[str, str, float]]
-) -> str:
-    """Obsidian/GitHub wiki 호환 마크다운 포맷 (백링크 지원)"""
-    today = report_date or dt.date.today().isoformat()
-    # If report_date is missing (e.g., rate limited), fall back to CLI date if provided.
-    if (not report_date) and indices.get("_as_of"):
-        today = indices["_as_of"]
-    yesterday = (dt.datetime.fromisoformat(today) - dt.timedelta(days=1)).strftime("%Y-%m-%d")
-
-    lines = [
-        "---",
-        f"date: {today}",
-        "type: market-snapshot",
-        "tags: [market, daily, indices]",
-        "---",
-        "",
-        f"# Daily Market Snapshot - {today}",
-        "",
-    ]
-
-    # US Indices
-    lines.append("## 🇺🇸 US Indices")
-    lines.append("")
-    lines.append("| Index | Close | Change | % |")
-    lines.append("|-------|------:|-------:|--:|")
-    for name, data in indices.get("US", {}).items():
-        if data.get("close"):
-            lines.append(f"| [[{name}]] | {data['close']:,.2f} | {data['change']:+,.2f} | {data['pct']:+.2f}% |")
-        else:
-            lines.append(f"| [[{name}]] | - | - | - |")
-    lines.append("")
-
-    # HK Index
-    lines.append("## 🇭🇰 Hong Kong")
-    lines.append("")
-    lines.append("| Index | Close | Change | % |")
-    lines.append("|-------|------:|-------:|--:|")
-    for name, data in indices.get("HK", {}).items():
-        if data.get("close"):
-            lines.append(f"| [[{name}]] | {data['close']:,.2f} | {data['change']:+,.2f} | {data['pct']:+.2f}% |")
-        else:
-            lines.append(f"| [[{name}]] | - | - | - |")
-    lines.append("")
-
-    # Top Gainers
-    if gainers:
-        lines.append("## 📈 Top Gainers")
-        lines.append("")
-        for ticker, name, pct in gainers[:10]:
-            ticker_clean = ticker.replace("-", "")
-            lines.append(f"- [[{ticker_clean}]] **{pct:+.2f}%** - {name}")
-        lines.append("")
-
-    # Top Losers
-    if losers:
-        lines.append("## 📉 Top Losers")
-        lines.append("")
-        for ticker, name, pct in losers[:10]:
-            ticker_clean = ticker.replace("-", "")
-            lines.append(f"- [[{ticker_clean}]] **{pct:+.2f}%** - {name}")
-        lines.append("")
-
-    # Related
-    lines.append("---")
-    lines.append("")
-    lines.append("## Related")
-    lines.append("")
-    lines.append(f"- [[Daily Market Snapshot - {yesterday}|어제 시황]]")
-    lines.append(f"- [[Global News - {today}|오늘 뉴스]]")
-
-    return "\n".join(lines)
-
-
 def _get_movers_alphavantage(df: pd.DataFrame, market: str) -> tuple[list[tuple[str, str, float]], list[tuple[str, str, float]]]:
-    """Get top movers using Alpha Vantage.
-
-    Due to rate limit (5/min), only fetch top 25 tickers.
-    Returns (gainers, losers) tuple.
-    """
-    tickers = df["ticker"].astype(str).tolist()[:25]  # Limit due to rate limit
+    """Get top movers using Alpha Vantage. Returns (gainers, losers)."""
+    tickers = df["ticker"].astype(str).tolist()[:25]
     ticker_to_name = dict(zip(df["ticker"], df["name"]))
 
     gainers = []
     losers = []
 
     for i, ticker in enumerate(tickers):
-        # Alpha Vantage uses plain symbols for US stocks
         av_symbol = ticker.replace("-", ".")
 
         quote = _alphavantage_quote(av_symbol)
@@ -415,8 +492,6 @@ def _get_movers_alphavantage(df: pd.DataFrame, market: str) -> tuple[list[tuple[
             else:
                 losers.append(item)
 
-        # Rate limit: 5 calls per minute = 12 seconds between calls
-        # But we'll use 13 seconds to be safe
         if i < len(tickers) - 1:
             print(f"  [{market}] Fetched {ticker}, waiting... ({i+1}/{len(tickers)})")
             time.sleep(13)
@@ -433,7 +508,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     as_of = args.date
 
-    # Index definitions with Stooq symbols
+    # Index definitions
     us = {
         "S&P 500": {"ticker": "^GSPC", "stooq": "^spx"},
         "NASDAQ 100": {"ticker": "^NDX", "stooq": "^ndx"},
@@ -454,45 +529,46 @@ def main(argv: Iterable[str] | None = None) -> int:
     sections = []
     failures = []
     report_date: dt.date | None = None
-
-    # 마크다운용 인덱스 데이터 수집
-    indices_data: dict[str, dict] = {"US": {}, "CN": {}, "HK": {}, "_as_of": as_of}
+    indices_data: dict[str, dict] = {"US": {}, "CN": {}, "HK": {}}
 
     cache = _load_cache()
 
-    print("Fetching index data from Stooq...")
+    print("Fetching index data (multi-source fallback)...")
     region_map = [
         ("🇺🇸 미국 (전일 종가 기준)", us, "US"),
         ("🇨🇳 중국 (직전 거래일 종가 기준)", cn, "CN"),
         ("🇭🇰 홍콩 (직전 거래일 종가 기준)", hk, "HK")
     ]
+
     for title, mp, region in region_map:
         rows = []
         for name, spec in mp.items():
             ticker = spec["ticker"]
             stooq_sym = spec.get("stooq")
 
+            print(f"  {name} ({ticker}):")
             r = _last_two_closes_index(ticker, stooq_symbol=stooq_sym, as_of=as_of)
+
             if r is None:
                 rows.append(_fmt_row(name, None, None, None))
                 failures.append(ticker)
-                indices_data[region][name] = {"close": None, "change": None, "pct": None}
+                indices_data[region][name] = {"close": None, "change": None, "pct": None, "source": None}
                 continue
 
-            d, close, prev = r
+            d, close, prev, source = r
             chg = close - prev
             pct = (close / prev - 1.0) * 100.0
             rows.append(_fmt_row(name, close, chg, pct))
 
             cache[ticker] = {"date": d.strftime("%Y-%m-%d"), "close": close, "prev": prev}
-            indices_data[region][name] = {"close": close, "change": chg, "pct": pct}
+            indices_data[region][name] = {"close": close, "change": chg, "pct": pct, "source": source}
 
             if report_date is None:
                 report_date = d.date()
 
         sections.append(_section(title, rows))
 
-    # Movers (using Alpha Vantage for US only due to rate limits)
+    # Movers
     movers_blocks = []
     us_gainers: list[tuple[str, str, float]] = []
     us_losers: list[tuple[str, str, float]] = []
@@ -505,31 +581,27 @@ def main(argv: Iterable[str] | None = None) -> int:
         print("\nFetching US movers from Alpha Vantage (this takes ~5 minutes due to rate limit)...")
         us_gainers, us_losers = _get_movers_alphavantage(uni_us, "US")
         movers_blocks.append(_format_gainers_losers(us_gainers, us_losers, "🇺🇸 미국 (NDX)"))
-
-        # For CN and HK, Alpha Vantage doesn't support well, so skip or use placeholder
         movers_blocks.append("🇨🇳 중국 상승/하락 Top 10\n- (Alpha Vantage 미지원)")
         movers_blocks.append("🇭🇰 홍콩 상승/하락 Top 10\n- (Alpha Vantage 미지원)")
 
     _save_cache(cache)
 
-    # 마크다운 저장
+    # Use --date if provided, otherwise use report_date from data
+    final_date = as_of or (report_date.isoformat() if report_date else dt.date.today().isoformat())
+
+    # Markdown output
     if args.markdown:
         os.makedirs(os.path.dirname(args.markdown) or ".", exist_ok=True)
-        md_content = _format_markdown(
-            report_date.isoformat() if report_date else (as_of or dt.date.today().isoformat()),
-            indices_data,
-            us_gainers,
-            us_losers
-        )
+        md_content = _format_markdown(final_date, indices_data, us_gainers, us_losers)
         with open(args.markdown, "w", encoding="utf-8") as f:
             f.write(md_content)
         print(f"\n마크다운이 {args.markdown}에 저장되었습니다.")
 
-    date_line = f"기준일(데이터 최신일): {report_date.isoformat()}" if report_date else "기준일: 조회 실패"
+    date_line = f"기준일(데이터 최신일): {final_date}"
 
     comments = [
         "코멘트:",
-        "- 지수: Stooq 무료 API 사용",
+        "- 데이터 소스: Stooq → Alpha Vantage(ETF) → yfinance → Cache (폴백)",
         "- US Movers: Alpha Vantage 무료 API (분당 5회 제한)",
         "- CN/HK Movers: Alpha Vantage 미지원으로 스킵",
     ]

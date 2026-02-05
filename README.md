@@ -13,8 +13,27 @@ Daily market snapshot & news crawler for personal automation and note-taking.
 
 | Script | Description | Data Source |
 |--------|-------------|-------------|
-| `daily_market_prices.py` | 지수 + 상승/하락 Top 10 | Stooq, Alpha Vantage |
+| `daily_market_prices.py` | 지수 + 상승/하락 Top 10 | Multi-source fallback (아래 참조) |
 | `news_crawler.py` | 글로벌 뉴스 크롤링 | BlackQuant |
+
+### Data Source Fallback Chain
+
+`daily_market_prices.py`는 다음 순서로 데이터를 조회합니다:
+
+```
+1. Cache (최근 2일 이내) → 가장 빠름
+2. Stooq Daily CSV → 무료, 속도 제한 있음
+3. Alpha Vantage (ETF 프록시) → SPY, QQQ, EWH
+4. yfinance → 백업
+5. Cache (오래된 데이터) → 최후의 수단
+```
+
+**ETF 프록시 매핑:**
+| Index | ETF Proxy | Reason |
+|-------|-----------|--------|
+| S&P 500 (^GSPC) | SPY | Alpha Vantage는 지수 직접 조회 불가 |
+| NASDAQ 100 (^NDX) | QQQ | ETF로 대체 |
+| Hang Seng (^HSI) | EWH | iShares MSCI Hong Kong ETF |
 
 ## Installation
 
@@ -76,21 +95,21 @@ python3 news_crawler.py -o news.json
 Obsidian/GitHub wiki 호환 형식으로 저장됩니다:
 
 ```markdown
-# Daily Market Snapshot
-date: 2026-02-06
+# Daily Market Snapshot - 2026-02-06
 
-## US Indices
-| Index | Close | Change |
-|-------|-------|--------|
-| [[S&P 500]] | 6,785.20 | -1.42% |
+## 🇺🇸 US Indices
+| Index | Close | Change | % | Source |
+|-------|------:|-------:|--:|--------|
+| [[S&P 500]] | 6,819.57 | -63.15 | -0.92% | stooq |
+| [[NASDAQ 100]] | 24,690.87 | -200.38 | -0.81% | alphavantage(QQQ) |
 
-## Top Gainers
-- [[AMGN]] +8.15% - Amgen
-- [[CHTR]] +5.38% - Charter Communications
+## 📈 Top Gainers
+- [[AMGN]] **+8.15%** - Amgen
+- [[CHTR]] **+5.38%** - Charter Communications
 
 ## Related
-- [[2026-02-05|어제 시황]]
-- [[AMZN|Amazon 관련 뉴스]]
+- [[Daily Market Snapshot - 2026-02-05|어제 시황]]
+- [[Global News - 2026-02-06|오늘 뉴스]]
 ```
 
 ### Telegram (--telegram)
@@ -146,9 +165,13 @@ python3 news_crawler.py --important --limit 20 --markdown news/$(date +%Y-%m-%d)
 
 ## Notes
 
-- Alpha Vantage 무료 tier: 분당 5회 제한 (movers 조회 ~5분 소요)
-- Stooq: 중국 지수 미지원
-- BlackQuant 뉴스: JavaScript 렌더링 필요 (Playwright 사용)
+- **Multi-source fallback**: 하나의 소스가 실패해도 자동으로 다음 소스 시도
+- **Alpha Vantage 무료 tier**: 분당 5회 제한 (movers 조회 ~5분 소요)
+- **Stooq**: 간헐적 rate limit 발생 → Alpha Vantage로 자동 폴백
+- **yfinance**: 백업용, rate limit 발생 시 폴백
+- **Cache**: `~/Library/Caches/market-daily-prices/cache.json`에 저장
+- **중국 지수**: Stooq 미지원, ETF 프록시 없음 → 캐시 데이터 사용
+- **BlackQuant 뉴스**: JavaScript 렌더링 필요 (Playwright 사용)
 
 ## File Structure
 
