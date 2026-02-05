@@ -299,6 +299,80 @@ def _get_universe_hk_hsi() -> pd.DataFrame:
     return df.head(60)
 
 
+def _format_markdown(
+    report_date: str,
+    indices: dict[str, dict],
+    gainers: list[tuple[str, str, float]],
+    losers: list[tuple[str, str, float]]
+) -> str:
+    """Obsidian/GitHub wiki 호환 마크다운 포맷 (백링크 지원)"""
+    today = report_date or dt.date.today().isoformat()
+    yesterday = (dt.datetime.fromisoformat(today) - dt.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    lines = [
+        "---",
+        f"date: {today}",
+        "type: market-snapshot",
+        "tags: [market, daily, indices]",
+        "---",
+        "",
+        f"# Daily Market Snapshot - {today}",
+        "",
+    ]
+
+    # US Indices
+    lines.append("## 🇺🇸 US Indices")
+    lines.append("")
+    lines.append("| Index | Close | Change | % |")
+    lines.append("|-------|------:|-------:|--:|")
+    for name, data in indices.get("US", {}).items():
+        if data.get("close"):
+            lines.append(f"| [[{name}]] | {data['close']:,.2f} | {data['change']:+,.2f} | {data['pct']:+.2f}% |")
+        else:
+            lines.append(f"| [[{name}]] | - | - | - |")
+    lines.append("")
+
+    # HK Index
+    lines.append("## 🇭🇰 Hong Kong")
+    lines.append("")
+    lines.append("| Index | Close | Change | % |")
+    lines.append("|-------|------:|-------:|--:|")
+    for name, data in indices.get("HK", {}).items():
+        if data.get("close"):
+            lines.append(f"| [[{name}]] | {data['close']:,.2f} | {data['change']:+,.2f} | {data['pct']:+.2f}% |")
+        else:
+            lines.append(f"| [[{name}]] | - | - | - |")
+    lines.append("")
+
+    # Top Gainers
+    if gainers:
+        lines.append("## 📈 Top Gainers")
+        lines.append("")
+        for ticker, name, pct in gainers[:10]:
+            ticker_clean = ticker.replace("-", "")
+            lines.append(f"- [[{ticker_clean}]] **{pct:+.2f}%** - {name}")
+        lines.append("")
+
+    # Top Losers
+    if losers:
+        lines.append("## 📉 Top Losers")
+        lines.append("")
+        for ticker, name, pct in losers[:10]:
+            ticker_clean = ticker.replace("-", "")
+            lines.append(f"- [[{ticker_clean}]] **{pct:+.2f}%** - {name}")
+        lines.append("")
+
+    # Related
+    lines.append("---")
+    lines.append("")
+    lines.append("## Related")
+    lines.append("")
+    lines.append(f"- [[Daily Market Snapshot - {yesterday}|어제 시황]]")
+    lines.append(f"- [[Global News - {today}|오늘 뉴스]]")
+
+    return "\n".join(lines)
+
+
 def _get_movers_alphavantage(df: pd.DataFrame, market: str) -> tuple[list[tuple[str, str, float]], list[tuple[str, str, float]]]:
     """Get top movers using Alpha Vantage.
 
@@ -337,6 +411,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--date", help="YYYY-MM-DD (optional). If omitted, uses latest available.")
     ap.add_argument("--skip-movers", action="store_true", help="Skip fetching movers (faster)")
+    ap.add_argument("--markdown", "-m", type=str, help="마크다운 출력 파일 경로")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
     as_of = args.date
@@ -363,10 +438,18 @@ def main(argv: Iterable[str] | None = None) -> int:
     failures = []
     report_date: dt.date | None = None
 
+    # 마크다운용 인덱스 데이터 수집
+    indices_data: dict[str, dict] = {"US": {}, "CN": {}, "HK": {}}
+
     cache = _load_cache()
 
     print("Fetching index data from Stooq...")
-    for title, mp in [("🇺🇸 미국 (전일 종가 기준)", us), ("🇨🇳 중국 (직전 거래일 종가 기준)", cn), ("🇭🇰 홍콩 (직전 거래일 종가 기준)", hk)]:
+    region_map = [
+        ("🇺🇸 미국 (전일 종가 기준)", us, "US"),
+        ("🇨🇳 중국 (직전 거래일 종가 기준)", cn, "CN"),
+        ("🇭🇰 홍콩 (직전 거래일 종가 기준)", hk, "HK")
+    ]
+    for title, mp, region in region_map:
         rows = []
         for name, spec in mp.items():
             ticker = spec["ticker"]
@@ -376,6 +459,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             if r is None:
                 rows.append(_fmt_row(name, None, None, None))
                 failures.append(ticker)
+                indices_data[region][name] = {"close": None, "change": None, "pct": None}
                 continue
 
             d, close, prev = r
@@ -384,6 +468,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             rows.append(_fmt_row(name, close, chg, pct))
 
             cache[ticker] = {"date": d.strftime("%Y-%m-%d"), "close": close, "prev": prev}
+            indices_data[region][name] = {"close": close, "change": chg, "pct": pct}
 
             if report_date is None:
                 report_date = d.date()
@@ -392,6 +477,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     # Movers (using Alpha Vantage for US only due to rate limits)
     movers_blocks = []
+    us_gainers: list[tuple[str, str, float]] = []
+    us_losers: list[tuple[str, str, float]] = []
 
     if args.skip_movers:
         movers_blocks.append("🇺🇸 미국 상승/하락 Top 10\n- (--skip-movers 옵션으로 스킵)")
@@ -407,6 +494,19 @@ def main(argv: Iterable[str] | None = None) -> int:
         movers_blocks.append("🇭🇰 홍콩 상승/하락 Top 10\n- (Alpha Vantage 미지원)")
 
     _save_cache(cache)
+
+    # 마크다운 저장
+    if args.markdown:
+        os.makedirs(os.path.dirname(args.markdown) or ".", exist_ok=True)
+        md_content = _format_markdown(
+            report_date.isoformat() if report_date else dt.date.today().isoformat(),
+            indices_data,
+            us_gainers,
+            us_losers
+        )
+        with open(args.markdown, "w", encoding="utf-8") as f:
+            f.write(md_content)
+        print(f"\n마크다운이 {args.markdown}에 저장되었습니다.")
 
     date_line = f"기준일(데이터 최신일): {report_date.isoformat()}" if report_date else "기준일: 조회 실패"
 
