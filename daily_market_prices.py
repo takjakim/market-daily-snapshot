@@ -307,6 +307,9 @@ def _format_markdown(
 ) -> str:
     """Obsidian/GitHub wiki 호환 마크다운 포맷 (백링크 지원)"""
     today = report_date or dt.date.today().isoformat()
+    # If report_date is missing (e.g., rate limited), fall back to CLI date if provided.
+    if (not report_date) and indices.get("_as_of"):
+        today = indices["_as_of"]
     yesterday = (dt.datetime.fromisoformat(today) - dt.timedelta(days=1)).strftime("%Y-%m-%d")
 
     lines = [
@@ -439,7 +442,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     report_date: dt.date | None = None
 
     # 마크다운용 인덱스 데이터 수집
-    indices_data: dict[str, dict] = {"US": {}, "CN": {}, "HK": {}}
+    indices_data: dict[str, dict] = {"US": {}, "CN": {}, "HK": {}, "_as_of": as_of}
 
     cache = _load_cache()
 
@@ -499,7 +502,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.markdown:
         os.makedirs(os.path.dirname(args.markdown) or ".", exist_ok=True)
         md_content = _format_markdown(
-            report_date.isoformat() if report_date else dt.date.today().isoformat(),
+            report_date.isoformat() if report_date else (as_of or dt.date.today().isoformat()),
             indices_data,
             us_gainers,
             us_losers
