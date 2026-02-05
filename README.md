@@ -108,6 +108,42 @@ date: 2026-02-06
 |----------|-------------|---------|
 | `ALPHA_VANTAGE_API_KEY` | Alpha Vantage API 키 | 내장 키 사용 |
 
+## Claude Code 연동
+
+생성된 마크다운 파일을 Claude Code(클로드봇)가 읽고 후처리할 수 있습니다.
+
+### 사용 예시
+
+```bash
+# 1. 스크립트로 마크다운 생성
+python3 news_crawler.py --markdown news/2026-02-06.md
+
+# 2. Claude Code에게 후처리 요청
+# "news/2026-02-06.md 읽고 한글로 요약해줘"
+# "daily/2026-02-06.md에 시장 코멘트 추가해줘"
+```
+
+### Claude Code가 할 수 있는 작업
+
+| 작업 | 설명 | 예시 프롬프트 |
+|------|------|--------------|
+| 요약 다듬기 | 뉴스 요약을 더 간결하게 | "요약을 2줄로 줄여줘" |
+| 한글 번역 | 영문 뉴스 한글화 | "제목들 한글로 번역해줘" |
+| 코멘트 추가 | 시황 분석 코멘트 | "오늘 시장 분석 코멘트 추가해줘" |
+| 백링크 추가 | 관련 노트 연결 | "관련 종목 노트 링크 추가해줘" |
+| 포맷 수정 | 마크다운 구조 변경 | "테이블을 리스트로 바꿔줘" |
+
+### 자동화 워크플로우
+
+```bash
+# 매일 자동 실행 (cron 등)
+python3 daily_market_prices.py --markdown daily/$(date +%Y-%m-%d).md
+python3 news_crawler.py --important --limit 20 --markdown news/$(date +%Y-%m-%d).md
+
+# Claude Code로 후처리
+# → 파일 읽기 → 내용 다듬기 → 저장
+```
+
 ## Notes
 
 - Alpha Vantage 무료 tier: 분당 5회 제한 (movers 조회 ~5분 소요)
