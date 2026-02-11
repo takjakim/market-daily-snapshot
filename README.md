@@ -1,6 +1,21 @@
-# market-daily-snapshot
+# Market Daily Snapshot
 
-Daily market snapshot & news crawler for personal automation and note-taking.
+Daily market snapshot + news crawler for personal automation and note-taking.
+
+- Generates **indices + top movers** in Markdown (Obsidian-style `[[wikilink]]` compatible)
+- Crawls global news (BlackQuant) and exports Markdown/JSON
+
+## Quickstart
+
+```bash
+pip install -r requirements.txt
+
+# 시장 스냅샷(지수 + movers) → 마크다운 저장
+python3 daily_market_prices.py --markdown daily/$(date +%Y-%m-%d).md
+
+# 뉴스(중요 뉴스) → 마크다운 저장
+python3 news_crawler.py --important --limit 20 --markdown news/$(date +%Y-%m-%d).md
+```
 
 ## Features
 
@@ -45,6 +60,8 @@ pip install -r requirements.txt
 pip install playwright
 playwright install chromium
 ```
+
+> Tip: movers 조회는 Alpha Vantage 무료 제한(분당 5회) 때문에 3~5분 걸릴 수 있음.
 
 ## Usage
 
